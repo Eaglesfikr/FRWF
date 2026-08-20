@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 import tqdm
 import os
+from sinkhorn_loss import sinkhorn_distance_loss  # <-- 新增: 导入 Sinkhorn 跨模态损失
 
 # ==========================================
 # 1. 设备配置与参数设置
@@ -23,23 +24,27 @@ kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
 print(f"Device: {device}")
 
 # 超参数
-batch_size = 512
+batch_size = 128
 fp16_precision = True
 temperature = 0.5
 num_epoches = 100
 alpha = 0.8  # 时域和频域自监督损失的权重
 beta = 0.2   # 时频一致性损失的权重
 
+# ===== Sinkhorn 超参数 (新增) =====
+sinkhorn_epsilon = 0.05       # 熵正则化系数
+sinkhorn_iterations = 20      # Sinkhorn 迭代步数
+
 # ==========================================
-# 2. 数据加载 (去掉增强视图，使用监督对比学习)
+# 2. 数据加载
 # ==========================================
 print("Loading Time and Frequency domain datasets...")
 
-# --- 加载时域数据 (只需原始数据) ---
+# --- 加载时域数据 ---
 time_data_orig = np.load('./datasets/awf1.npz')
 x_time = time_data_orig['feature']
 
-# --- 加载频域数据 (只需原始数据) ---
+# --- 加载频域数据 ---
 freq_data_orig = np.load('./datasets/awf1_freq.npz')
 x_freq = freq_data_orig['x']
 
@@ -53,7 +58,7 @@ num_classes = len(np.unique(y_train))
 print(f"Number of classes: {num_classes}")
 
 # ==========================================
-# 3. 模型定义 (Backbone & Projection Head)
+# 3. 模型定义 (不变)
 # ==========================================
 class DFNet(nn.Module):
     def __init__(self, out_dim, input_feature_dim):
@@ -178,7 +183,7 @@ class DualDomainModel(nn.Module):
         return z_time, z_freq
 
 # ==========================================
-# 4. 数据加载器 (去掉增强视图，加入标签)
+# 4. 数据加载器
 # ==========================================
 class DualDomainDataset(Dataset):
     def __init__(self, x_time, x_freq, y):
@@ -193,7 +198,7 @@ class DualDomainDataset(Dataset):
         return len(self.x_time)
 
 # ==========================================
-# 5. 监督对比学习训练逻辑
+# 5. 训练逻辑 (只改了 cross-modal 部分)
 # ==========================================
 class SupervisedDualCLR(object):
     def __init__(self, **args):
@@ -207,12 +212,13 @@ class SupervisedDualCLR(object):
         self.temperature = args['temperature']
         self.alpha = args['alpha']
         self.beta = args['beta']
+        self.sinkhorn_epsilon = args.get('sinkhorn_epsilon', 0.05)
+        self.sinkhorn_iterations = args.get('sinkhorn_iterations', 20)
         self.log_every_n_step = 100
 
     def supervised_contrastive_loss(self, features, labels):
         """
-        Supervised Contrastive Loss (SupCon)
-        L = -1/|P(i)| * sum_{p in P(i)} log( exp(z_i·z_p/τ) / sum_{a in A(i)} exp(z_i·z_a/τ) )
+        Supervised Contrastive Loss (SupCon) — 时域/频域内部损失，不变。
         """
         batch_size = features.shape[0]
 
@@ -248,7 +254,8 @@ class SupervisedDualCLR(object):
         n_iter = 0
 
         print(f"Start Dual-Domain Supervised Contrastive Learning for {self.num_epoches} epochs")
-        print(f"  alpha={self.alpha} (time+freq supcon), beta={self.beta} (cross-consistency)")
+        print(f"  alpha={self.alpha} (time+freq supcon), beta={self.beta} (cross-modal sinkhorn)")
+        print(f"  sinkhorn_epsilon={self.sinkhorn_epsilon}, sinkhorn_iterations={self.sinkhorn_iterations}")
 
         for epoch_counter in range(self.num_epoches + 1):
             epoch_loss_time = 0.0
@@ -261,26 +268,30 @@ class SupervisedDualCLR(object):
                     tepoch.set_description(f"Epoch {epoch_counter}")
                     self.model.train()
 
-                    # 增加通道维度 (Batch, Length) -> (Batch, 1, Length)
+                    # (Batch, Length) -> (Batch, 1, Length)
                     x_time = x_time.view(x_time.size(0), 1, x_time.size(1)).float().to(self.device)
                     x_freq = x_freq.view(x_freq.size(0), 1, x_freq.size(1)).float().to(self.device)
                     labels = labels.long().to(self.device)
 
                     with autocast(enabled=self.fp16_precision):
-                        # 前向传播，获取时域和频域的投影特征
+                        # 前向传播
                         z_time, z_freq = self.model(x_time, x_freq)
 
-                        # 1. 时域监督对比损失
+                        # 1. 时域监督对比损失 (不变)
                         loss_time = self.supervised_contrastive_loss(z_time, labels)
 
-                        # 2. 频域监督对比损失
+                        # 2. 频域监督对比损失 (不变)
                         loss_freq = self.supervised_contrastive_loss(z_freq, labels)
 
-                        # 3. 时频一致性损失 (Cross-modal SupCon)
-                        # 将时域和频域的原始样本拼在一起，同类跨域互为正样本
-                        z_cross = torch.cat([z_time, z_freq], dim=0)
-                        cross_labels = torch.cat([labels, labels], dim=0)
-                        loss_consistency = self.supervised_contrastive_loss(z_cross, cross_labels)
+                        # ========== 3. 跨模态 Sinkhorn 对齐损失 (新增) ==========
+                        # 用 Sinkhorn 最优传输替代原来的 cat+SupCon
+                        loss_consistency = sinkhorn_distance_loss(
+                            z_time, z_freq, labels,
+                            temperature=self.temperature,
+                            epsilon=self.sinkhorn_epsilon,
+                            sinkhorn_iterations=self.sinkhorn_iterations,
+                            device=self.device
+                        )
 
                         # 总损失
                         loss = self.alpha * (loss_time + loss_freq) + self.beta * loss_consistency
@@ -316,13 +327,12 @@ class SupervisedDualCLR(object):
             # 保存模型
             if epoch_counter % 20 == 0 and epoch_counter > 0:
                 os.makedirs('./checkpoints/WFTFC/', exist_ok=True)
-                torch.save(self.model.state_dict(), f'./checkpoints/WFTFC/WFTFC_dualsupcon_epoch_{epoch_counter}.pth.tar')
+                torch.save(self.model.state_dict(), f'./checkpoints/WFTFC/WFTFC_dualsupcon_sinkhorn_epoch_{epoch_counter}.pth.tar')
 
 # ==========================================
 # 6. 主程序入口
 # ==========================================
 if __name__ == "__main__":
-    # 创建数据集和数据加载器
     train_dataset = DualDomainDataset(x_time, x_freq, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -347,6 +357,8 @@ if __name__ == "__main__":
         num_epoches=num_epoches,
         batch_size=batch_size,
         alpha=alpha,
-        beta=beta
+        beta=beta,
+        sinkhorn_epsilon=sinkhorn_epsilon,
+        sinkhorn_iterations=sinkhorn_iterations
     )
     trainer.train(train_loader)

@@ -1,5 +1,5 @@
 """
-提取 AWF1 第一个样本的时域和频域特征（分别打印）
+提取 源域AWF1 第一个样本的时域和频域特征（分别打印）
 使用 Sinkhorn 预训练模型
 """
 from __future__ import absolute_import, division, print_function, unicode_literals
@@ -248,3 +248,8 @@ np.savez('./features/first_sample_features.npz',
          label=label)
 print("\n特征已保存至 ./features/first_sample_features.npz")
 print("Done!")
+"""
+骨干网络特征（h_time、h_freq——经全连接层后为512维）的方差更大
+（标准差约0.45），而投影特征（z_time、z_freq——128维）由于经过投影头和
+归一化处理，分布更为紧凑（标准差约0.08，以0为中心）。
+"""
